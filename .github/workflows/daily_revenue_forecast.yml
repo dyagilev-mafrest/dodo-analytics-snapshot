@@ -1,0 +1,75 @@
+name: Daily Revenue Forecast
+
+on:
+  schedule:
+    - cron: "15 2 * * *"   # UTC 02:15, after Daily Revenue Load has landed today's actuals
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: false
+        default: ""
+      to_date:
+        description: "End date (YYYY-MM-DD)"
+        required: false
+        default: ""
+
+jobs:
+  compute-revenue-forecast:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        id: install_deps
+        run: pip install -r requirements.txt
+
+      - name: Run revenue forecast script
+        id: run_script
+        env:
+          SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
+          SUPABASE_DATABASE: ${{ secrets.SUPABASE_DATABASE }}
+          SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PASSWORD: ${{ secrets.SUPABASE_PASSWORD }}
+          USE_CLOUD_DB: ${{ secrets.USE_CLOUD_DB }}
+        run: |
+          # No Dodo IS API calls here — purely derived from daily_sales already in
+          # Supabase — so it's cheap to just recompute the last ~120 days every day
+          # (covers late-arriving/corrected actuals feeding back into the median).
+          if [ -n "${{ github.event.inputs.from_date }}" ]; then
+            FROM="${{ github.event.inputs.from_date }}"
+            TO="${{ github.event.inputs.to_date }}"
+          else
+            FROM=$(date -d "120 days ago" +%Y-%m-%d)
+            TO=$(date +%Y-%m-%d)
+          fi
+          echo "Computing revenue forecast: $FROM to $TO"
+          python compute_revenue_forecast.py --from-date "$FROM" --to-date "$TO"
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          FAILED_STEP="unknown"
+          [ "${{ steps.checkout.outcome }}" = "failure" ] && FAILED_STEP="Checkout repository"
+          [ "${{ steps.setup_python.outcome }}" = "failure" ] && FAILED_STEP="Set up Python"
+          [ "${{ steps.install_deps.outcome }}" = "failure" ] && FAILED_STEP="Install dependencies"
+          [ "${{ steps.run_script.outcome }}" = "failure" ] && FAILED_STEP="Run revenue forecast script"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="⚠️ ${{ github.workflow }} упал на шаге «${FAILED_STEP}»
+          ${RUN_URL}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}"

@@ -1,0 +1,101 @@
+name: Daily Ratings Load
+
+# РКО и РС по пиццериям из controlling-api (ratings_unit_period).
+#
+# Своего расписания здесь СОЗНАТЕЛЬНО НЕТ: загрузчик встаёт в ночную цепочку
+# daily_all.yml. Отдельный cron вернул бы ту самую проблему, из-за которой
+# цепочку и собрали — GitHub держит на concurrency-группу только один ожидающий
+# прогон, и загрузчики вытесняли друг друга со статусом `cancelled`.
+#
+# Почему ежедневно, хотя рейтинги публикуются по понедельникам (РКО) и дважды в
+# месяц (РС): внутри периода балл живёт. Он приходит со `publishStatus:
+# Calculated` и меняется после апелляций, поэтому нужен последний снимок, а не
+# первый. Upsert по (kind, unit_id, period_from) делает повторные прогоны
+# внутри периода безобидными.
+
+on:
+  workflow_call:
+    inputs:
+      called:
+        description: "Служебный флаг: workflow вызван из оркестратора daily_all.yml. Вручную не задавать."
+        type: boolean
+        required: false
+        default: true
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "Какой рейтинг грузить"
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - customer-experience
+          - standards
+
+concurrency:
+  # Та же логика, что у остальных загрузчиков: ручной запуск сериализуется общей
+  # группой (refresh_token одноразовый, два параллельных обновления сожгут его
+  # друг другу), вызов из оркестратора берёт уникальную группу — иначе прогон
+  # ждал бы группу, которую держит вызывающий.
+  group: ${{ inputs.called && format('dodo-is-api-call-{0}', github.run_id) || 'dodo-is-api' }}
+  cancel-in-progress: false
+
+jobs:
+  load-ratings:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        id: install_deps
+        run: pip install -r requirements.txt
+
+      - name: Run ratings script
+        id: run_script
+        env:
+          DODO_CLIENT_ID: ${{ secrets.DODO_CLIENT_ID }}
+          DODO_CLIENT_SECRET: ${{ secrets.DODO_CLIENT_SECRET }}
+          DODO_COUNTRY: ${{ secrets.DODO_COUNTRY }}
+          SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
+          SUPABASE_DATABASE: ${{ secrets.SUPABASE_DATABASE }}
+          SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PASSWORD: ${{ secrets.SUPABASE_PASSWORD }}
+          USE_CLOUD_DB: "true"
+        run: |
+          # Эндпоинт отдаёт только текущий период, from/to у него нет —
+          # поэтому в отличие от остальных загрузчиков даты не передаём.
+          KIND="${{ github.event.inputs.kind }}"
+          if [ -n "$KIND" ] && [ "$KIND" != "both" ]; then
+            python get_ratings.py --kind "$KIND"
+          else
+            python get_ratings.py
+          fi
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          FAILED_STEP="unknown"
+          [ "${{ steps.checkout.outcome }}" = "failure" ] && FAILED_STEP="Checkout repository"
+          [ "${{ steps.setup_python.outcome }}" = "failure" ] && FAILED_STEP="Set up Python"
+          [ "${{ steps.install_deps.outcome }}" = "failure" ] && FAILED_STEP="Install dependencies"
+          [ "${{ steps.run_script.outcome }}" = "failure" ] && FAILED_STEP="Run ratings script"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="⚠️ Daily Ratings Load упал на шаге «${FAILED_STEP}»
+          ${RUN_URL}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}"

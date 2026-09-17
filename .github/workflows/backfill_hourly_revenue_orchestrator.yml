@@ -1,0 +1,127 @@
+name: Backfill Hourly Revenue Orchestrator
+
+# One-off orchestrator for the 2024-> backfill of hourly_revenue_by_channel/_by_sector
+# (feeds compute_stop_lost_revenue.py). Runs entirely in GitHub Actions so it survives
+# the operator's machine being offline — no dependency on a local session.
+#
+# Self-chaining pattern: each run dispatches exactly ONE chunk of ONE of the two
+# underlying workflows, waits for it to finish (bounded by that chunk's own runtime,
+# safely under the 6h per-job limit), then dispatches the NEXT run of this same
+# workflow with chunk_index+1 and exits. Uses GH_PAT (not the default GITHUB_TOKEN) —
+# GitHub blocks GITHUB_TOKEN-triggered workflow_dispatch calls from cascading further.
+#
+# ⚠️ 17.09.2026: секрет GH_PAT удалён из репозитория — прежний PAT протух через 90
+# дней, а единственным, что его требовало постоянно, было зеркалирование OAuth-пары
+# в секреты (убрано вместе с ним). Этот бэкфилл — разовый и уже отработал; если он
+# понадобится снова, сначала выпусти новый PAT (права: Actions — read and write,
+# Contents — read) и положи его в секрет GH_PAT, иначе gh упадёт на авторизации.
+
+on:
+  workflow_dispatch:
+    inputs:
+      chunk_index:
+        description: "Index into the chunk plan to process next (0-based)"
+        required: true
+        default: "0"
+      wait_run_id:
+        description: "Optional: wait for this existing run to finish before dispatching chunk_index (used once, for hand-off from a manually-started chunk)"
+        required: false
+        default: ""
+
+concurrency:
+  group: backfill-hourly-revenue-orchestrator
+  cancel-in-progress: false
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for handed-off run (if any)
+        if: ${{ github.event.inputs.wait_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          RUN_ID="${{ github.event.inputs.wait_run_id }}"
+          echo "Waiting for run $RUN_ID to finish..."
+          while true; do
+            STATUS=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json status --jq '.status')
+            if [ "$STATUS" = "completed" ]; then
+              CONCLUSION=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq '.conclusion')
+              echo "Run $RUN_ID finished: $CONCLUSION"
+              break
+            fi
+            sleep 60
+          done
+
+      - name: Dispatch this chunk and wait for it
+        id: run_chunk
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          declare -a PLAN=(
+            "daily_product_sales.yml 2024-01-15 2024-07-14"
+            "daily_sector_revenue.yml 2024-01-15 2024-07-14"
+            "daily_product_sales.yml 2024-07-15 2025-01-10"
+            "daily_sector_revenue.yml 2024-07-15 2025-01-10"
+            "daily_product_sales.yml 2025-01-11 2025-07-09"
+            "daily_sector_revenue.yml 2025-01-11 2025-07-09"
+            "daily_product_sales.yml 2025-07-10 2026-01-05"
+            "daily_sector_revenue.yml 2025-07-10 2026-01-05"
+            "daily_product_sales.yml 2026-01-06 2026-06-23"
+            "daily_sector_revenue.yml 2026-01-06 2026-06-23"
+          )
+          IDX=${{ github.event.inputs.chunk_index }}
+          TOTAL=${#PLAN[@]}
+          if [ "$IDX" -ge "$TOTAL" ]; then
+            echo "All $TOTAL chunks already done — nothing to dispatch."
+            echo "done=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          read -r WF FROM TO <<< "${PLAN[$IDX]}"
+          echo "[$IDX/$TOTAL] Dispatching $WF $FROM -> $TO"
+          gh workflow run "$WF" --repo "$GITHUB_REPOSITORY" -f from_date="$FROM" -f to_date="$TO"
+          sleep 15
+          RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow="$WF" --limit 1 --json databaseId --jq '.[0].databaseId')
+          echo "  run_id=$RUN_ID"
+          while true; do
+            STATUS=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json status --jq '.status')
+            if [ "$STATUS" = "completed" ]; then
+              CONCLUSION=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq '.conclusion')
+              echo "  $WF $FROM->$TO finished: $CONCLUSION"
+              break
+            fi
+            sleep 60
+          done
+          echo "next_index=$((IDX+1))" >> "$GITHUB_OUTPUT"
+          echo "done=false" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger next chunk
+        if: steps.run_chunk.outputs.done != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh workflow run backfill_hourly_revenue_orchestrator.yml --repo "$GITHUB_REPOSITORY" \
+            -f chunk_index="${{ steps.run_chunk.outputs.next_index }}"
+
+      - name: Notify Telegram when all chunks are done
+        if: steps.run_chunk.outputs.done == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=✅ Бэкфилл hourly_revenue_by_channel/_by_sector (2024-) завершён — все чанки прошли."
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="⚠️ Backfill Hourly Revenue Orchestrator упал на chunk_index=${{ github.event.inputs.chunk_index }}
+          ${RUN_URL}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}"

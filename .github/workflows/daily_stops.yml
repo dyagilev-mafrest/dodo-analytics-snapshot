@@ -1,0 +1,127 @@
+name: Daily Stops Load
+
+on:
+  workflow_call:
+    inputs:
+      called:
+        description: "Служебный флаг: workflow вызван из оркестратора daily_all.yml. Вручную не задавать."
+        type: boolean
+        required: false
+        default: true
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: false
+        default: ""
+      to_date:
+        description: "End date (YYYY-MM-DD)"
+        required: false
+        default: ""
+      open_days:
+        description: "Catch-up window for still-open stops, days (default 60)"
+        required: false
+        default: ""
+
+concurrency:
+  # Ручной запуск сериализуется общей группой: refresh_token у Dodo IS одноразовый и
+  # ротируется при каждом обновлении, два параллельных обновления сожгут токен друг
+  # другу (см. блокировку в token_store.py). Вызов из оркестратора идёт
+  # в уникальной группе — сериализация там обеспечена цепочкой needs, а попытка взять
+  # ту же группу, которую держит вызывающий прогон, привела бы к взаимоблокировке.
+  group: ${{ inputs.called && format('dodo-is-api-call-{0}', github.run_id) || 'dodo-is-api' }}
+  cancel-in-progress: false
+
+jobs:
+  load-stops:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        id: install_deps
+        run: pip install -r requirements.txt
+
+      - name: Run stops script
+        id: run_script
+        env:
+          DODO_CLIENT_ID: ${{ secrets.DODO_CLIENT_ID }}
+          DODO_CLIENT_SECRET: ${{ secrets.DODO_CLIENT_SECRET }}
+          DODO_COUNTRY: ${{ secrets.DODO_COUNTRY }}
+          SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
+          SUPABASE_DATABASE: ${{ secrets.SUPABASE_DATABASE }}
+          SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PASSWORD: ${{ secrets.SUPABASE_PASSWORD }}
+          USE_CLOUD_DB: "true"
+        run: |
+          OPEN_DAYS="${{ github.event.inputs.open_days }}"
+          OPEN_DAYS="${OPEN_DAYS:-60}"
+
+          if [ -n "${{ github.event.inputs.from_date }}" ]; then
+            # Ручной бэкфилл конкретного диапазона — считаем ровно его,
+            # без окна дозакрытия (оно про «последние N дней», а не про прошлое).
+            FROM="${{ github.event.inputs.from_date }}"
+            TO="${{ github.event.inputs.to_date }}"
+            CATCHUP_FROM="$FROM"
+            REFRESH_OPEN=0
+          else
+            FROM=$(TZ=Asia/Yakutsk date -d "7 days ago" +%Y-%m-%d)
+            TO=$(TZ=Asia/Yakutsk date -d "yesterday" +%Y-%m-%d)
+            CATCHUP_FROM=$(TZ=Asia/Yakutsk date -d "$OPEN_DAYS days ago" +%Y-%m-%d)
+            REFRESH_OPEN=1
+          fi
+
+          echo "Loading stop-sales data: $FROM to $TO"
+          python get_stops.py --from-date "$FROM" --to-date "$TO"
+
+          # Дозакрытие стопов, проживших дольше окна выше: get_stops.py обновляет
+          # ended_at_local только у строк, чья дата НАЧАЛА попала в прогон, поэтому
+          # длинный стоп иначе навсегда остаётся открытым и не попадает в расчёт
+          # (compute_lost_revenue.py считает только закрытые).
+          if [ "$REFRESH_OPEN" = "1" ]; then
+            echo "Refreshing still-open stops (last $OPEN_DAYS days)"
+            python refresh_open_stops.py --max-age-days "$OPEN_DAYS"
+          fi
+
+          # Считаем по всему окну дозакрытия, а не по $FROM: стоп, закрывшийся
+          # только что, начался недели назад — по 7-дневному окну его бы не пересчитали.
+          echo "Computing product lost revenue: $CATCHUP_FROM to $TO"
+          python compute_lost_revenue.py --from-date "$CATCHUP_FROM" --to-date "$TO"
+          echo "Computing ingredient stop impact: $CATCHUP_FROM to $TO"
+          python compute_ingredient_stop_impact.py --from-date "$CATCHUP_FROM" --to-date "$TO"
+          # Второе слагаемое метрики «Стопы продуктов»: продукт выключили сам по
+          # себе, ингредиента за ним нет. Обязательно ПОСЛЕ ingredient_stop_impact —
+          # правило отбора читает его, чтобы не задвоить стоп, у которого
+          # ингредиентная причина есть (см. compute_product_stop_impact.py, issue #15).
+          echo "Computing product stop impact: $CATCHUP_FROM to $TO"
+          python compute_product_stop_impact.py --from-date "$CATCHUP_FROM" --to-date "$TO"
+          echo "Computing stop lost revenue (channel/sector): $CATCHUP_FROM to $TO"
+          python compute_stop_lost_revenue.py --from-date "$CATCHUP_FROM" --to-date "$TO"
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          FAILED_STEP="unknown"
+          [ "${{ steps.checkout.outcome }}" = "failure" ] && FAILED_STEP="Checkout repository"
+          [ "${{ steps.setup_python.outcome }}" = "failure" ] && FAILED_STEP="Set up Python"
+          [ "${{ steps.install_deps.outcome }}" = "failure" ] && FAILED_STEP="Install dependencies"
+          [ "${{ steps.run_script.outcome }}" = "failure" ] && FAILED_STEP="Run stops script"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="⚠️ Daily Stops Load упал на шаге «${FAILED_STEP}»
+          ${RUN_URL}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}"

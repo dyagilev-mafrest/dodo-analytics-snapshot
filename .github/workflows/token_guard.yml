@@ -1,0 +1,100 @@
+name: Token Guard
+
+on:
+  # Собственное расписание, ЗАРАНЕЕ до оркестратора (daily_all.yml, 00:55 UTC):
+  # страж обновляет пару в dodo_oauth_token в тихое время и падает на сутки
+  # раньше загрузчиков, давая окно на починку.
+  #
+  # С 14.09.2026 токен живёт в БД под блокировкой, а не в секретах, поэтому
+  # разбор ниже описывает уже не действующий механизм — он оставлен, чтобы
+  # стража не «оптимизировали» обратно внутрь цепочки: раннее предупреждение
+  # работает только при отдельном, более раннем расписании.
+  #
+  # ⚠️ Стража нельзя звать из самого daily_all.yml — там он ломает собственных
+  # соседей. Задание получает значения секретов, снятые на СТАРТЕ прогона;
+  # обновление, сделанное стражем внутри того же прогона, до них не доедет, зато
+  # рефреш отзывает выданный ранее access_token и проворачивает одноразовый
+  # refresh_token. В итоге соседи держат уже отозванный токен (401), а
+  # дорефрешить не могут — их refresh_token страж только что сжёг (400 на
+  # auth.dodois.io/connect/token). Ровно это положило прогон 33593782664
+  # 02.09.2026: упали revenue, country-lfl, handover-time-stats, product-sales,
+  # sector-revenue, quality.
+  schedule:
+    - cron: "30 0 * * *"   # UTC 00:30 = 09:30 Yakutsk, за 25 минут до daily_all
+  workflow_call:
+    inputs:
+      called:
+        description: "Служебный флаг: workflow вызван из оркестратора daily_all.yml. Вручную не задавать."
+        type: boolean
+        required: false
+        default: true
+  workflow_dispatch:
+
+concurrency:
+  # Ручной запуск сериализуется общей группой: refresh_token у Dodo IS одноразовый и
+  # ротируется при каждом обновлении, два параллельных обновления сожгут токен друг
+  # другу (см. блокировку в token_store.py). Вызов из оркестратора идёт
+  # в уникальной группе — сериализация там обеспечена цепочкой needs, а попытка взять
+  # ту же группу, которую держит вызывающий прогон, привела бы к взаимоблокировке.
+  group: ${{ inputs.called && format('dodo-is-api-call-{0}', github.run_id) || 'dodo-is-api' }}
+  cancel-in-progress: false
+
+jobs:
+  refresh-token:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        id: install_deps
+        run: pip install -r requirements.txt
+
+      - name: Refresh OAuth token
+        id: run_script
+        env:
+          DODO_CLIENT_ID: ${{ secrets.DODO_CLIENT_ID }}
+          DODO_CLIENT_SECRET: ${{ secrets.DODO_CLIENT_SECRET }}
+          DODO_COUNTRY: ${{ secrets.DODO_COUNTRY }}
+          SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
+          SUPABASE_DATABASE: ${{ secrets.SUPABASE_DATABASE }}
+          SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PASSWORD: ${{ secrets.SUPABASE_PASSWORD }}
+          USE_CLOUD_DB: ${{ secrets.USE_CLOUD_DB }}
+        run: python refresh_token_guard.py
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          FAILED_STEP="unknown"
+          [ "${{ steps.checkout.outcome }}" = "failure" ] && FAILED_STEP="Checkout repository"
+          [ "${{ steps.setup_python.outcome }}" = "failure" ] && FAILED_STEP="Set up Python"
+          [ "${{ steps.install_deps.outcome }}" = "failure" ] && FAILED_STEP="Install dependencies"
+          [ "${{ steps.run_script.outcome }}" = "failure" ] && FAILED_STEP="Refresh OAuth token"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Страж пишет разбор причины в guard_failure_reason.txt (см.
+          # refresh_token_guard.py). Без него алерт сообщает только имя упавшего
+          # шага, а по нему не видно, что делать: падение 12-13.09.2026 из-за
+          # этого пролежало двое суток.
+          TEXT="⚠️ Token Guard упал на шаге «${FAILED_STEP}»
+          ${RUN_URL}"
+          if [ -f guard_failure_reason.txt ]; then
+            TEXT="${TEXT}
+
+          $(cat guard_failure_reason.txt)"
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}"

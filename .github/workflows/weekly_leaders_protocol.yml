@@ -1,0 +1,74 @@
+name: Weekly Leaders Protocol Load
+
+# РАСПИСАНИЕ ОТКЛЮЧЕНО 09.09.2026 — остался только ручной запуск.
+#
+# Причина: управляющий заполняет гугл-протокол не вовремя, и загрузчик
+# исправно затирал выверенные вручную цифры пустотой из листа. У снапшота
+# 02.09 fact_week так и остался NULL — авторы протокола факты не
+# пересчитывают. Автоматика, которая перезаписывает хорошие данные плохими,
+# хуже отсутствия автоматики.
+#
+# Куда идём: планы переезжают в единую таблицу планов, источником станет
+# согласованный с директором Excel-прогноз, а факт мы и так считаем сами
+# (сверено: leadership_actual_revenue совпадает с sum(daily_sales.sales) до
+# округления). После этого get_leaders_protocol.py и leaders_protocol_metrics*
+# уходят целиком — см. issue про единую таблицу планов.
+#
+# Прежнее расписание, если понадобится вернуть:
+#   schedule:
+#     - cron: "0 3 * * 3"   # UTC 03:00 = 12:00 Yakutsk, среда
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: dodo-leaders-protocol
+  cancel-in-progress: false
+
+jobs:
+  load-leaders-protocol:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        id: install_deps
+        run: pip install -r requirements.txt
+
+      - name: Run leaders protocol script
+        id: run_script
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
+          SUPABASE_DATABASE: ${{ secrets.SUPABASE_DATABASE }}
+          SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PASSWORD: ${{ secrets.SUPABASE_PASSWORD }}
+          USE_CLOUD_DB: "true"
+        run: python get_leaders_protocol.py
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          FAILED_STEP="unknown"
+          [ "${{ steps.checkout.outcome }}" = "failure" ] && FAILED_STEP="Checkout repository"
+          [ "${{ steps.setup_python.outcome }}" = "failure" ] && FAILED_STEP="Set up Python"
+          [ "${{ steps.install_deps.outcome }}" = "failure" ] && FAILED_STEP="Install dependencies"
+          [ "${{ steps.run_script.outcome }}" = "failure" ] && FAILED_STEP="Run leaders protocol script"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="⚠️ ${{ github.workflow }} упал на шаге «${FAILED_STEP}»
+          ${RUN_URL}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}"

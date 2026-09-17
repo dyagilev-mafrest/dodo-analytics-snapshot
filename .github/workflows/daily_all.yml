@@ -1,0 +1,114 @@
+name: Daily ETL
+
+# Единая ночная цепочка всех загрузчиков, которые ходят в Dodo IS API.
+#
+# Зачем: раньше каждый загрузчик имел собственное расписание и все 13 сидели в общей
+# concurrency-группе `dodo-is-api` (сериализация обязательна — refresh_token у Dodo IS
+# одноразовый и ротируется при каждом обновлении). Но GitHub держит на группу только
+# ОДИН ожидающий прогон: каждый следующий вытесняет предыдущего со статусом
+# `cancelled`. Разнесённые cron'ы от этого не спасают, потому что GitHub при нехватке
+# раннеров задерживает расписание и выпускает накопившееся пачкой — фактические старты
+# гуляли с 02:4x до 14:2x. За 60 дней так отменилось 74 прогона; у Daily Restaurant
+# 12 дней подряд, у Daily Sector Revenue 11 — из-за чего в hourly_revenue_by_sector
+# образовалась дыра за 03-07.08.2026 (окно самолечения 7 дней её не перекрыло).
+#
+# Теперь это ОДИН прогон: очередь на группу не набивается, вытеснять нечего.
+# Порядок сохранён из прежних cron'ов, время в комментариях — исходное UTC.
+# `!cancelled()` вместо `always()`: падение одного загрузчика не блокирует остальные,
+# но ручная отмена прогона действительно останавливает цепочку.
+#
+# Каждый загрузчик остаётся отдельным файлом с собственным `workflow_dispatch` и
+# собственным Telegram-уведомлением — ручной запуск одной джобы работает как раньше.
+
+on:
+  schedule:
+    - cron: "55 0 * * *"   # UTC 00:55 = 09:55 Yakutsk
+  workflow_dispatch:
+
+concurrency:
+  group: dodo-is-api
+  cancel-in-progress: false
+
+# ⚠️ Стража (token_guard.yml) здесь СОЗНАТЕЛЬНО НЕТ — у него собственное
+# расписание на 00:30 UTC, за 25 минут до этого прогона. Внутри цепочки он ломал
+# собственных соседей: обновлённые им секреты достаются только следующему
+# прогону, а вот отзыв старого access_token и проворот одноразового
+# refresh_token происходят сразу — и все задания остаются с мёртвым токеном,
+# который уже нечем обновить. См. комментарий в token_guard.yml.
+jobs:
+  revenue:                         # было 01:00
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_revenue.yml
+    secrets: inherit
+
+  country-lfl:                     # было 01:05
+    needs: revenue
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_country_lfl.yml
+    secrets: inherit
+
+  handover-time-stats:             # было 01:10
+    needs: country-lfl
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_handover_time_stats.yml
+    secrets: inherit
+
+  delivery:                        # было 01:30
+    needs: handover-time-stats
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_delivery.yml
+    secrets: inherit
+
+  product-sales:                   # было 01:45
+    needs: delivery
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_product_sales.yml
+    secrets: inherit
+
+  restaurant:                      # было 01:47
+    needs: product-sales
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_restaurant.yml
+    secrets: inherit
+
+  sector-revenue:                  # было 01:50
+    needs: restaurant
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_sector_revenue.yml
+    secrets: inherit
+
+  quality:                         # было 01:55
+    needs: sector-revenue
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_quality.yml
+    secrets: inherit
+
+  productivity:                    # было 02:00
+    needs: quality
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_productivity.yml
+    secrets: inherit
+
+  team:                            # было 02:05
+    needs: productivity
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_team.yml
+    secrets: inherit
+
+  stops:                           # было 02:15
+    needs: team
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_stops.yml
+    secrets: inherit
+
+  recruiting:                      # было 02:20
+    needs: stops
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_recruiting.yml
+    secrets: inherit
+
+  ratings:                         # добавлен 11.09.2026, своего cron'а не имел
+    needs: recruiting
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/daily_ratings.yml
+    secrets: inherit

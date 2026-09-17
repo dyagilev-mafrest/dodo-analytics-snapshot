@@ -1,0 +1,11 @@
+.env
+venv/
+tokens.json
+tokens.json.*
+dodo.db
+__pycache__/
+*.pyc
+*.pyo
+backups/
+kb_cache/
+guard_failure_reason.txt

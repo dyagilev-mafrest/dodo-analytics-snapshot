@@ -1,0 +1,89 @@
+name: Daily Handover Time Stats Load
+
+on:
+  workflow_call:
+    inputs:
+      called:
+        description: "Служебный флаг: workflow вызван из оркестратора daily_all.yml. Вручную не задавать."
+        type: boolean
+        required: false
+        default: true
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: false
+        default: ""
+      to_date:
+        description: "End date (YYYY-MM-DD)"
+        required: false
+        default: ""
+
+concurrency:
+  # Ручной запуск сериализуется общей группой: refresh_token у Dodo IS одноразовый и
+  # ротируется при каждом обновлении, два параллельных обновления сожгут токен друг
+  # другу (см. блокировку в token_store.py). Вызов из оркестратора идёт
+  # в уникальной группе — сериализация там обеспечена цепочкой needs, а попытка взять
+  # ту же группу, которую держит вызывающий прогон, привела бы к взаимоблокировке.
+  group: ${{ inputs.called && format('dodo-is-api-call-{0}', github.run_id) || 'dodo-is-api' }}
+  cancel-in-progress: false
+
+jobs:
+  load-handover-time-stats:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        id: install_deps
+        run: pip install -r requirements.txt
+
+      - name: Run handover time stats script
+        id: run_script
+        env:
+          DODO_CLIENT_ID: ${{ secrets.DODO_CLIENT_ID }}
+          DODO_CLIENT_SECRET: ${{ secrets.DODO_CLIENT_SECRET }}
+          DODO_COUNTRY: ${{ secrets.DODO_COUNTRY }}
+          SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
+          SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
+          SUPABASE_DATABASE: ${{ secrets.SUPABASE_DATABASE }}
+          SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
+          SUPABASE_PASSWORD: ${{ secrets.SUPABASE_PASSWORD }}
+          USE_CLOUD_DB: ${{ secrets.USE_CLOUD_DB }}
+        run: |
+          if [ -n "${{ github.event.inputs.from_date }}" ]; then
+            FROM="${{ github.event.inputs.from_date }}"
+            TO="${{ github.event.inputs.to_date }}"
+          else
+            FROM=$(TZ=Asia/Yakutsk date -d "7 days ago" +%Y-%m-%d)
+            TO=$(TZ=Asia/Yakutsk date -d "yesterday" +%Y-%m-%d)
+          fi
+          echo "Loading handover time stats: $FROM to $TO"
+          python get_handover_time_stats.py --from-date "$FROM" --to-date "$TO"
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          FAILED_STEP="unknown"
+          [ "${{ steps.checkout.outcome }}" = "failure" ] && FAILED_STEP="Checkout repository"
+          [ "${{ steps.setup_python.outcome }}" = "failure" ] && FAILED_STEP="Set up Python"
+          [ "${{ steps.install_deps.outcome }}" = "failure" ] && FAILED_STEP="Install dependencies"
+          [ "${{ steps.run_script.outcome }}" = "failure" ] && FAILED_STEP="Run handover time stats script"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="⚠️ Daily Handover Time Stats Load упал на шаге «${FAILED_STEP}»
+          ${RUN_URL}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}"
